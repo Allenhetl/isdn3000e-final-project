@@ -1,0 +1,9 @@
+string match_id
+uint32 turn_index
+uint8 player_id
+uint8 piece_id
+uint8 cell_id
+moveit_msgs/RobotTrajectory home_to_pick
+moveit_msgs/RobotTrajectory pick_to_home
+moveit_msgs/RobotTrajectory home_to_place
+moveit_msgs/RobotTrajectory place_to_home

@@ -1,0 +1,50 @@
+{
+  "name": "ISDN3000E Final Project",
+  "dockerComposeFile": [
+    "./docker/docker-compose.yml"
+  ],
+  "service": "ros",
+  "runServices": [
+    "ros",
+    "novnc"
+  ],
+  "workspaceFolder": "/workspace",
+  "shutdownAction": "stopCompose",
+  "forwardPorts": [
+    8080,
+    6080
+  ],
+  "portsAttributes": {
+    "8080": {
+      "label": "viser GUI",
+      "onAutoForward": "notify"
+    },
+    "6080": {
+      "label": "noVNC GUI",
+      "onAutoForward": "notify"
+    }
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-iot.vscode-ros",
+        "ms-python.mypy-type-checker",
+        "ms-python.pylint",
+        "ms-python.python",
+        "xaver.clang-format",
+        "ms-vscode.cmake-tools",
+        "ms-vscode.cpptools",
+        "twxs.cmake",
+        "ms-vscode.cpptools-extension-pack"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "C_Cpp.default.intelliSenseMode": "linux-gcc-x64",
+        "C_Cpp.default.compileCommands": "/workspace/build/compile_commands.json",
+        "cmake.configureOnOpen": false
+      }
+    }
+  },
+  "remoteUser": "developer"
+}

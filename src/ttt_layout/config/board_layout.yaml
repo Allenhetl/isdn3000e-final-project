@@ -1,0 +1,48 @@
+planning_frame: panda_link0
+ee_frame: panda_hand_tcp
+attach_distance_threshold: 0.07
+pick_approach_height: 0.10
+place_approach_height: 0.10
+
+piece_size:
+  x: 0.05
+  y: 0.05
+  z: 0.05
+
+home_joint_state:
+  names:
+    - panda_joint1
+    - panda_joint2
+    - panda_joint3
+    - panda_joint4
+    - panda_joint5
+    - panda_joint6
+    - panda_joint7
+  positions: [0.0, -0.785398, 0.0, -2.356194, 0.0, 1.570796, 0.785398]
+
+cells:
+  - {id: 0, x: 0.40, y: 0.09, z: 0.025}
+  - {id: 1, x: 0.49, y: 0.09, z: 0.025}
+  - {id: 2, x: 0.58, y: 0.09, z: 0.025}
+  - {id: 3, x: 0.40, y: 0.00, z: 0.025}
+  - {id: 4, x: 0.49, y: 0.00, z: 0.025}
+  - {id: 5, x: 0.58, y: 0.00, z: 0.025}
+  - {id: 6, x: 0.40, y: -0.09, z: 0.025}
+  - {id: 7, x: 0.49, y: -0.09, z: 0.025}
+  - {id: 8, x: 0.58, y: -0.09, z: 0.025}
+
+pieces:
+  - {piece_id: 0, owner: 0, x: 0.40, y: 0.18, z: 0.025}
+  - {piece_id: 1, owner: 0, x: 0.49, y: 0.18, z: 0.025}
+  - {piece_id: 2, owner: 0, x: 0.58, y: 0.18, z: 0.025}
+  - {piece_id: 3, owner: 0, x: 0.67, y: 0.09, z: 0.025}
+  - {piece_id: 4, owner: 0, x: 0.67, y: 0.00, z: 0.025}
+  - {piece_id: 5, owner: 0, x: 0.67, y: -0.09, z: 0.025}
+
+
+  - {piece_id: 6, owner: 1, x: 0.31, y: 0.09, z: 0.025}
+  - {piece_id: 7, owner: 1, x: 0.31, y: 0.00, z: 0.025}
+  - {piece_id: 8, owner: 1, x: 0.31, y: -0.09, z: 0.025}
+  - {piece_id: 9, owner: 1, x: 0.40, y: -0.18, z: 0.025}
+  - {piece_id: 10, owner: 1, x: 0.49, y: -0.18, z: 0.025}
+  - {piece_id: 11, owner: 1, x: 0.58, y: -0.18, z: 0.025}

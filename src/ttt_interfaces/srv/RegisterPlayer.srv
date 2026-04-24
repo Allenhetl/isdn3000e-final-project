@@ -1,0 +1,6 @@
+string player_name
+string service_name
+---
+bool success
+uint8 assigned_player_id
+string message

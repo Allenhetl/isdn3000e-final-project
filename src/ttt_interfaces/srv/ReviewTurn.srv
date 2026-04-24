@@ -1,0 +1,5 @@
+TurnPlan plan
+GameSnapshot snapshot
+WorkspaceLayout layout
+---
+ExecutionResult result

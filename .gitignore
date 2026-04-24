@@ -1,0 +1,20 @@
+# ROS2 / colcon build artifacts
+build/
+install/
+log/
+
+# IDE
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+
+# Verification artifacts
+artifacts/

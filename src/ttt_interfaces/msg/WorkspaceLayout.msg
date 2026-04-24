@@ -1,0 +1,9 @@
+string planning_frame
+string ee_frame
+sensor_msgs/JointState home_joint_state
+geometry_msgs/Pose[9] cell_poses
+PieceState[] initial_pieces
+geometry_msgs/Vector3 piece_size
+float64 attach_distance_threshold
+float64 pick_approach_height
+float64 place_approach_height

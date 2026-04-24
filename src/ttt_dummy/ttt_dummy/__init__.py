@@ -1,0 +1,1 @@
+"""Scripted dummy player package."""

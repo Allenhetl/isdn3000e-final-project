@@ -1,0 +1,9 @@
+string match_id
+uint32 turn_index
+uint8 player_id
+GameSnapshot snapshot
+WorkspaceLayout layout
+---
+bool accepted
+string message
+TurnPlan plan

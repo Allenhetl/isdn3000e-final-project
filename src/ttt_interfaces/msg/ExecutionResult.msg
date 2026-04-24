@@ -1,0 +1,10 @@
+uint8 REASON_NONE=0
+uint8 REASON_TIMEOUT=1
+uint8 REASON_INVALID_CELL=2
+uint8 REASON_INVALID_PIECE=3
+uint8 REASON_MALFORMED_TRAJECTORY=4
+uint8 REASON_REPLAY_REJECTED=5
+
+bool success
+uint8 failure_reason
+string message

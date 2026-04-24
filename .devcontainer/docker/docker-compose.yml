@@ -1,0 +1,42 @@
+services:
+  ros:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: base
+      args:
+        WORKSPACE_DIR: ${WORKSPACE_DIR}
+        USERNAME: ${DEVCONTAINER_USERNAME}
+        UID: ${DEVCONTAINER_UID}
+        GID: ${DEVCONTAINER_GID}
+        UBUNTU_VERSION: ${UBUNTU_VERSION}
+    container_name: isdn3000e_final_project_ros
+    command: sleep infinity
+    shm_size: 512m
+    tty: true
+    stdin_open: true
+    volumes:
+      - ../..:/workspace:cached
+    environment:
+      - DISPLAY=novnc:0.0
+      - XDG_RUNTIME_DIR=/tmp/runtime-${DEVCONTAINER_USERNAME}
+      - ROS_DOMAIN_ID=42
+    networks:
+      - x11
+    depends_on:
+      - novnc
+
+  novnc:
+    image: theasp/novnc:latest
+    container_name: isdn3000e_final_project_novnc
+    environment:
+      - DISPLAY_WIDTH=1600
+      - DISPLAY_HEIGHT=900
+      - RUN_XTERM=no
+    ports:
+      - "6080:8080"
+    networks:
+      - x11
+
+networks:
+  x11:
