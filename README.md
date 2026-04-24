@@ -37,6 +37,21 @@ We might update or fix the bug of this repo. Please instruct your coding agent a
   - a scripted dummy opponent
 - Your player must return a valid `TurnPlan` for each turn.
 
+## Game Logic
+
+<img src="./assets/image-20260424120237590.png" alt="image-20260424120237590" style="zoom:50%;" />
+
+The game is essentially a [Tic-tac-toe](https://en.wikipedia.org/wiki/Tic-tac-toe) in a [pick-and-place sense](https://en.wikipedia.org/wiki/Pick-and-place_machine). 
+
+- red: your board to play
+- green: belongs to player 0
+- blue: belongs to player 1 (student)
+
+
+
+You need to pick the blue cube into the red cell to win the game.
+
+
 ## What You Need To Do
 
 Implement the missing logic in:
