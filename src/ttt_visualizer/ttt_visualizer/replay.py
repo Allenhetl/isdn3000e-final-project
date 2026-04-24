@@ -50,19 +50,6 @@ def clone_piece(piece: PieceState) -> PieceState:
     return clone
 
 
-def pose_to_xyz(pose: Pose) -> np.ndarray:
-    return np.array([pose.position.x, pose.position.y, pose.position.z], dtype=float)
-
-
-def pose_from_xyz(position: np.ndarray) -> Pose:
-    pose = Pose()
-    pose.position.x = float(position[0])
-    pose.position.y = float(position[1])
-    pose.position.z = float(position[2])
-    pose.orientation.w = 1.0
-    return pose
-
-
 def get_phase_trajectory(plan: TurnPlan, phase_name: str):
     return getattr(plan, phase_name).joint_trajectory
 
@@ -103,8 +90,7 @@ def replay_piece_states(
     base_pieces: list[PieceState],
     plan: TurnPlan,
     target_pose: Pose,
-    attach_distance_threshold: float,
-    tcp_positions_by_phase: dict[str, list[np.ndarray]],
+    tcp_poses_by_phase: dict[str, list[Pose]],
     selection: ReplaySelection,
 ) -> dict[int, PieceState]:
     pieces = {piece.piece_id: clone_piece(piece) for piece in base_pieces}
@@ -112,48 +98,19 @@ def replay_piece_states(
     if active_piece is None:
         return pieces
 
-    attached = False
-    target_position = pose_to_xyz(target_pose)
-    selected_phase_index = PHASE_NAMES.index(selection.phase_name)
-
-    for phase_index, phase_name in enumerate(PHASE_NAMES):
-        tcp_positions = tcp_positions_by_phase.get(phase_name, [])
-        if phase_index > selected_phase_index:
-            break
-
-        last_point_index = len(tcp_positions) - 1
-        if phase_index == selected_phase_index:
-            last_point_index = clamp_point_index(selection.point_index, len(tcp_positions))
-
-        if last_point_index < 0:
-            continue
-
-        for point_index in range(last_point_index + 1):
-            tcp_position = tcp_positions[point_index]
-            piece_position = pose_to_xyz(active_piece.pose)
-
-            if (
-                not attached
-                and np.linalg.norm(tcp_position - piece_position)
-                <= attach_distance_threshold
-            ):
-                attached = True
-                active_piece.location = PieceState.LOCATION_ATTACHED
-                active_piece.available = False
-
-            if attached:
-                active_piece.pose = pose_from_xyz(tcp_position)
-
-            if (
-                attached
-                and phase_index >= 2
-                and np.linalg.norm(tcp_position - target_position)
-                <= attach_distance_threshold
-            ):
-                attached = False
-                active_piece.location = PieceState.LOCATION_BOARD
-                active_piece.cell_id = plan.cell_id
-                active_piece.pose = clone_pose(target_pose)
+    if selection.phase_name in ("pick_to_home", "home_to_place"):
+        tcp_poses = tcp_poses_by_phase.get(selection.phase_name, [])
+        if tcp_poses:
+            point_index = clamp_point_index(selection.point_index, len(tcp_poses))
+            active_piece.pose = clone_pose(tcp_poses[point_index])
+        active_piece.location = PieceState.LOCATION_ATTACHED
+        active_piece.available = False
+        active_piece.cell_id = 255
+    elif selection.phase_name == "place_to_home":
+        active_piece.location = PieceState.LOCATION_BOARD
+        active_piece.available = False
+        active_piece.cell_id = plan.cell_id
+        active_piece.pose = clone_pose(target_pose)
 
     pieces[int(plan.piece_id)] = clone_piece(active_piece)
     return pieces

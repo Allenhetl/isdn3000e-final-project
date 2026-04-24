@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import copy
+import re
 import threading
 
 import numpy as np
 import rclpy
 import viser
+from geometry_msgs.msg import Pose
 from rclpy.node import Node
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
@@ -25,6 +27,12 @@ from .replay import (
     replay_piece_states,
     safe_point_index,
 )
+
+
+FINGER_JOINTS = {
+    "panda_finger_joint1": 0.025,
+    "panda_finger_joint2": 0.025,
+}
 
 
 class TicTacToeVisualizerNode(Node):
@@ -77,11 +85,9 @@ class TicTacToeVisualizerNode(Node):
             self.prev_turn_button = self.server.gui.add_button("Previous Turn")
             self.next_turn_button = self.server.gui.add_button("Next Turn")
             self.clear_button = self.server.gui.add_button("Clear")
-            self.view_mode_selector = self.server.gui.add_button_group(
-                "View Mode", options=VIEW_MODES
-            )
-            self.phase_selector = self.server.gui.add_button_group(
-                "Phase", options=PHASE_NAMES
+            self.committed_snapshot_toggle = self.server.gui.add_checkbox(
+                "Show Board After This Turn",
+                initial_value=False,
             )
 
         with self.server.gui.add_folder("Trajectory Sliders"):
@@ -108,17 +114,13 @@ class TicTacToeVisualizerNode(Node):
         def _(_event) -> None:
             self._clear_recording()
 
-        @self.view_mode_selector.on_click
+        @self.committed_snapshot_toggle.on_update
         def _(event) -> None:
             if self.syncing_gui:
                 return
-            self._set_selected_view_mode(str(event.target.value))
-
-        @self.phase_selector.on_click
-        def _(event) -> None:
-            if self.syncing_gui:
-                return
-            self._set_selected_phase(str(event.target.value))
+            self._set_selected_view_mode(
+                "committed_snapshot" if bool(event.target.value) else "motion"
+            )
 
         for phase_name, slider in self.phase_sliders.items():
 
@@ -172,7 +174,6 @@ class TicTacToeVisualizerNode(Node):
                 return
             self.user_has_interacted = True
             self.selected_phase = phase_name
-            self.phase_selector.value = phase_name
         self._refresh_gui_and_scene()
 
     def _set_selected_view_mode(self, view_mode: str) -> None:
@@ -181,7 +182,6 @@ class TicTacToeVisualizerNode(Node):
                 return
             self.user_has_interacted = True
             self.selected_view_mode = view_mode
-            self.view_mode_selector.value = view_mode
         self._refresh_gui_and_scene()
 
     def _on_slider_update(self, phase_name: str) -> None:
@@ -247,8 +247,9 @@ class TicTacToeVisualizerNode(Node):
             has_next = bool(turns and self.selected_turn is not None and turns.index(self.selected_turn) < len(turns) - 1)
             self.prev_turn_button.disabled = not has_previous
             self.next_turn_button.disabled = not has_next
-            self.view_mode_selector.value = self.selected_view_mode
-            self.phase_selector.value = self.selected_phase
+            self.committed_snapshot_toggle.value = (
+                self.selected_view_mode == "committed_snapshot"
+            )
 
             plan = self.plan_by_turn.get(self.selected_turn) if self.selected_turn is not None else None
             for phase_name, slider in self.phase_sliders.items():
@@ -260,7 +261,7 @@ class TicTacToeVisualizerNode(Node):
                     continue
 
                 point_count = get_phase_point_count(plan, phase_name)
-                slider.disabled = point_count == 0
+                slider.disabled = point_count == 0 or self.selected_view_mode != "motion"
                 slider.min = 0.0
                 slider.max = float(max(1, point_count - 1))
                 clamped_value = safe_point_index(
@@ -273,12 +274,17 @@ class TicTacToeVisualizerNode(Node):
             self.syncing_gui = False
 
     def _build_scene_state_locked(self) -> tuple[str, dict[int, object], np.ndarray]:
-        snapshot = self.latest_snapshot
+        latest_snapshot = self.latest_snapshot
         turns = self._available_turns_locked()
         if not turns or self.selected_turn is None or self.selected_turn not in self.plan_by_turn:
-            pieces = self._snapshot_piece_dict(snapshot)
+            pieces = self._snapshot_piece_dict(latest_snapshot)
             return (
-                self._build_status_markdown(snapshot=snapshot, turns=turns, replay_summary="No accepted turn selected."),
+                self._build_status_markdown(
+                    latest_snapshot=latest_snapshot,
+                    displayed_snapshot=latest_snapshot,
+                    turns=turns,
+                    replay_summary="No accepted turn selected.",
+                ),
                 pieces,
                 self._expand_cfg(self.layout.home_joint_state.position),
             )
@@ -288,7 +294,8 @@ class TicTacToeVisualizerNode(Node):
             committed_snapshot = self.snapshot_by_turn.get(
                 committed_snapshot_turn(self.selected_turn)
             )
-            pieces = self._snapshot_piece_dict(committed_snapshot or snapshot)
+            displayed_snapshot = committed_snapshot or latest_snapshot
+            pieces = self._snapshot_piece_dict(displayed_snapshot)
             replay_summary = (
                 f"Selected turn: `{self.selected_turn}`  \n"
                 f"Selected view: `committed_snapshot`  \n"
@@ -297,7 +304,8 @@ class TicTacToeVisualizerNode(Node):
             )
             return (
                 self._build_status_markdown(
-                    snapshot=snapshot,
+                    latest_snapshot=latest_snapshot,
+                    displayed_snapshot=displayed_snapshot,
                     turns=turns,
                     replay_summary=replay_summary,
                 ),
@@ -310,16 +318,16 @@ class TicTacToeVisualizerNode(Node):
         target_pose = self.layout.cell_poses[int(plan.cell_id)]
         point_index = self.selected_point_index_by_phase[self.selected_phase]
 
-        tcp_positions_by_phase: dict[str, list[np.ndarray]] = {}
+        tcp_poses_by_phase: dict[str, list[Pose]] = {}
         final_cfg = self._expand_cfg(self.layout.home_joint_state.position)
         for phase_name in PHASE_NAMES:
             trajectory = get_phase_trajectory(plan, phase_name)
-            tcp_positions: list[np.ndarray] = []
+            tcp_poses: list[Pose] = []
             for point in trajectory.points:
                 cfg = self._expand_cfg(point.positions)
                 final_cfg = cfg
-                tcp_positions.append(self._tcp_position(cfg))
-            tcp_positions_by_phase[phase_name] = tcp_positions
+                tcp_poses.append(self._tcp_pose(cfg))
+            tcp_poses_by_phase[phase_name] = tcp_poses
 
         selected_trajectory = get_phase_trajectory(plan, self.selected_phase)
         if selected_trajectory.points:
@@ -334,8 +342,7 @@ class TicTacToeVisualizerNode(Node):
             base_pieces=base_pieces,
             plan=plan,
             target_pose=target_pose,
-            attach_distance_threshold=float(self.layout.attach_distance_threshold),
-            tcp_positions_by_phase=tcp_positions_by_phase,
+            tcp_poses_by_phase=tcp_poses_by_phase,
             selection=ReplaySelection(
                 phase_name=self.selected_phase,
                 point_index=clamped_index,
@@ -352,7 +359,8 @@ class TicTacToeVisualizerNode(Node):
         )
         return (
             self._build_status_markdown(
-                snapshot=snapshot,
+                latest_snapshot=latest_snapshot,
+                displayed_snapshot=base_snapshot,
                 turns=turns,
                 replay_summary=replay_summary,
             ),
@@ -362,30 +370,45 @@ class TicTacToeVisualizerNode(Node):
 
     def _build_status_markdown(
         self,
-        snapshot: GameSnapshot | None,
+        latest_snapshot: GameSnapshot | None,
+        displayed_snapshot: GameSnapshot | None,
         turns: list[int],
         replay_summary: str,
     ) -> str:
-        if snapshot is None:
+        if latest_snapshot is None:
             return (
                 "Match state not received yet.  \n"
                 f"Recorded turns: `{turns}`  \n"
                 f"{replay_summary}"
             )
 
+        current_snapshot = displayed_snapshot or latest_snapshot
         current_player = (
             "none"
-            if snapshot.current_player == GameSnapshot.NO_PLAYER
-            else str(snapshot.current_player)
+            if current_snapshot is None
+            or current_snapshot.current_player == GameSnapshot.NO_PLAYER
+            else str(current_snapshot.current_player)
         )
+        current_message = (
+            current_snapshot.message if current_snapshot is not None else latest_snapshot.message
+        )
+        current_player_name = self._extract_current_player_name(current_message)
         return (
-            f"Match: `{snapshot.match_id}`  \n"
-            f"Latest snapshot turn: `{snapshot.turn_index}`  \n"
-            f"Current player: `{current_player}`  \n"
+            f"Match: `{latest_snapshot.match_id}`  \n"
+            f"Latest snapshot turn: `{latest_snapshot.turn_index}`  \n"
+            f"Current Player Index: `{current_player}`  \n"
+            f"Current Player Name: `{current_player_name}`  \n"
             f"Recorded turns: `{turns}`  \n"
-            f"Message: {snapshot.message}  \n\n"
+            f"Message: {current_message}  \n\n"
             f"{replay_summary}"
         )
+
+    @staticmethod
+    def _extract_current_player_name(message: str) -> str:
+        match = re.search(r"Current player:\s*([^\.]+)", message)
+        if match is None:
+            return "none"
+        return match.group(1).strip() or "none"
 
     def _available_turns_locked(self) -> list[int]:
         return sorted(self.plan_by_turn.keys())
@@ -407,6 +430,7 @@ class TicTacToeVisualizerNode(Node):
                 piece.pose.position.y,
                 piece.pose.position.z,
             )
+            cube_wxyz = self._pose_wxyz(piece.pose)
 
             box_handle = self.piece_handles.get(piece.piece_id)
             if box_handle is None:
@@ -422,22 +446,91 @@ class TicTacToeVisualizerNode(Node):
                     visible=visible,
                 )
                 self.piece_handles[piece.piece_id] = box_handle
-                continue
 
             box_handle.position = cube_position
             box_handle.visible = visible
+            box_handle.wxyz = cube_wxyz
 
     def _expand_cfg(self, arm_positions) -> np.ndarray:
         joint_map = dict(zip(self.layout.home_joint_state.name, arm_positions))
+        joint_map.update(FINGER_JOINTS)
         expanded = [
             float(joint_map.get(joint_name, 0.0))
             for joint_name in self.actuated_joint_names
         ]
         return np.array(expanded, dtype=float)
 
-    def _tcp_position(self, cfg: np.ndarray) -> np.ndarray:
+    def _tcp_pose(self, cfg: np.ndarray) -> Pose:
         self.urdf.update_cfg(cfg)
-        return self.urdf.get_transform("panda_hand_tcp")[:3, 3]
+        transform = np.array(self.urdf.get_transform("panda_hand_tcp"), dtype=float)
+        orientation = self._rotation_matrix_to_xyzw(transform[:3, :3])
+        pose = Pose()
+        pose.position.x = float(transform[0, 3])
+        pose.position.y = float(transform[1, 3])
+        pose.position.z = float(transform[2, 3])
+        pose.orientation.x = orientation[0]
+        pose.orientation.y = orientation[1]
+        pose.orientation.z = orientation[2]
+        pose.orientation.w = orientation[3]
+        return pose
+
+    @staticmethod
+    def _pose_wxyz(pose: Pose) -> tuple[float, float, float, float]:
+        wxyz = np.array(
+            [
+                float(pose.orientation.w),
+                float(pose.orientation.x),
+                float(pose.orientation.y),
+                float(pose.orientation.z),
+            ],
+            dtype=float,
+        )
+        norm = float(np.linalg.norm(wxyz))
+        if norm == 0.0:
+            return (1.0, 0.0, 0.0, 0.0)
+        normalized = wxyz / norm
+        return (
+            float(normalized[0]),
+            float(normalized[1]),
+            float(normalized[2]),
+            float(normalized[3]),
+        )
+
+    @staticmethod
+    def _rotation_matrix_to_xyzw(rotation: np.ndarray) -> tuple[float, float, float, float]:
+        trace = float(np.trace(rotation))
+        if trace > 0.0:
+            s = np.sqrt(trace + 1.0) * 2.0
+            w = 0.25 * s
+            x = float((rotation[2, 1] - rotation[1, 2]) / s)
+            y = float((rotation[0, 2] - rotation[2, 0]) / s)
+            z = float((rotation[1, 0] - rotation[0, 1]) / s)
+        else:
+            diagonal = np.diag(rotation)
+            index = int(np.argmax(diagonal))
+            if index == 0:
+                s = np.sqrt(1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]) * 2.0
+                w = float((rotation[2, 1] - rotation[1, 2]) / s)
+                x = 0.25 * float(s)
+                y = float((rotation[0, 1] + rotation[1, 0]) / s)
+                z = float((rotation[0, 2] + rotation[2, 0]) / s)
+            elif index == 1:
+                s = np.sqrt(1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]) * 2.0
+                w = float((rotation[0, 2] - rotation[2, 0]) / s)
+                x = float((rotation[0, 1] + rotation[1, 0]) / s)
+                y = 0.25 * float(s)
+                z = float((rotation[1, 2] + rotation[2, 1]) / s)
+            else:
+                s = np.sqrt(1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]) * 2.0
+                w = float((rotation[1, 0] - rotation[0, 1]) / s)
+                x = float((rotation[0, 2] + rotation[2, 0]) / s)
+                y = float((rotation[1, 2] + rotation[2, 1]) / s)
+                z = 0.25 * float(s)
+
+        norm = float(np.linalg.norm([x, y, z, w]))
+        if norm == 0.0:
+            return (0.0, 0.0, 0.0, 1.0)
+        return (x / norm, y / norm, z / norm, w / norm)
 
 
 def main(args=None) -> None:
