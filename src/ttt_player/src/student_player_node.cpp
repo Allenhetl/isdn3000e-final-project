@@ -408,9 +408,39 @@ class StudentPlayerNode : public rclcpp::Node {
   void handle_plan_turn(
       const std::shared_ptr<ttt_interfaces::srv::PlanTurn::Request> request,
       std::shared_ptr<ttt_interfaces::srv::PlanTurn::Response> response) {
+    try {
+      handle_plan_turn_impl(request, response);
+    } catch (const std::exception &e) {
+      response->accepted = false;
+      response->message = std::string("exception in handle_plan_turn: ") + e.what();
+      RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+      dump_failure_context(request);
+    } catch (...) {
+      response->accepted = false;
+      response->message = "unknown non-std exception in handle_plan_turn";
+      RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+      dump_failure_context(request);
+    }
+  }
+
+  void handle_plan_turn_impl(
+      const std::shared_ptr<ttt_interfaces::srv::PlanTurn::Request> request,
+      std::shared_ptr<ttt_interfaces::srv::PlanTurn::Response> response) {
     if (request->player_id != player_id_) {
       response->accepted = false;
-      response->message = "Plan request does not match registered player id.";
+      response->message = "player_id mismatch: req=" +
+                          std::to_string(static_cast<unsigned>(request->player_id)) +
+                          " self=" + std::to_string(static_cast<unsigned>(player_id_));
+      RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+      dump_failure_context(request);
+      return;
+    }
+
+    if (!ik_client_->wait_for_service(2s)) {
+      response->accepted = false;
+      response->message = "compute_ik service not available after 2s";
+      RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+      dump_failure_context(request);
       return;
     }
 
@@ -419,25 +449,28 @@ class StudentPlayerNode : public rclcpp::Node {
       response->accepted = false;
       response->message = "no legal cell available";
       RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+      dump_failure_context(request);
       return;
     }
     RCLCPP_INFO(this->get_logger(), "turn=%u: minimax chose cell=%u",
                 static_cast<unsigned>(request->turn_index),
                 static_cast<unsigned>(cell_id));
 
-    if (cell_id >= request->layout.cell_poses.size()) {
+    if (static_cast<size_t>(cell_id) >= request->layout.cell_poses.size()) {
       response->accepted = false;
       response->message = "cell_id out of range for layout.cell_poses";
       RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+      dump_failure_context(request);
       return;
     }
 
     const auto ranked = rank_pieces_by_distance(request->snapshot, player_id_);
     if (ranked.empty()) {
       response->accepted = false;
-      response->message =
-          std::string("no available piece for player_") + std::to_string(player_id_);
+      response->message = "no available piece for player_" +
+                          std::to_string(static_cast<unsigned>(player_id_));
       RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+      dump_failure_context(request);
       return;
     }
     {
@@ -463,7 +496,8 @@ class StudentPlayerNode : public rclcpp::Node {
     for (uint8_t piece_id : ranked) {
       const auto piece_pose_opt = find_piece_pose(request->snapshot, piece_id);
       if (!piece_pose_opt) {
-        RCLCPP_WARN(this->get_logger(), "piece %u not found in snapshot, trying next",
+        RCLCPP_WARN(this->get_logger(),
+                    "piece %u not found in snapshot, trying next",
                     static_cast<unsigned>(piece_id));
         continue;
       }
@@ -473,34 +507,37 @@ class StudentPlayerNode : public rclcpp::Node {
           piece_pose_opt->position.z);
 
       auto pick_sol = compute_ik_robust(pick_link8);
-      if (!pick_sol) {
-        RCLCPP_WARN(this->get_logger(), "piece %u IK failed at pick, trying next",
-                    static_cast<unsigned>(piece_id));
-        continue;
+      const bool pick_ok = pick_sol.has_value();
+      auto place_sol = pick_ok ? compute_ik_robust(place_link8)
+                               : std::optional<std::vector<double>>{};
+      const bool place_ok = place_sol.has_value();
+
+      if (pick_ok && place_ok) {
+        chosen_piece = piece_id;
+        pick_joints = std::move(*pick_sol);
+        place_joints = std::move(*place_sol);
+        found = true;
+        RCLCPP_INFO(this->get_logger(),
+                    "piece %u IK ok (pick norm=%.3f, place norm=%.3f)",
+                    static_cast<unsigned>(piece_id),
+                    vector_l2_norm(pick_joints),
+                    vector_l2_norm(place_joints));
+        break;
       }
-      auto place_sol = compute_ik_robust(place_link8);
-      if (!place_sol) {
-        RCLCPP_WARN(this->get_logger(), "piece %u IK failed at place, trying next",
-                    static_cast<unsigned>(piece_id));
-        continue;
-      }
-      chosen_piece = piece_id;
-      pick_joints = std::move(*pick_sol);
-      place_joints = std::move(*place_sol);
-      found = true;
-      RCLCPP_INFO(this->get_logger(),
-                  "piece %u IK ok (pick joints=%zu, place joints=%zu)",
+      RCLCPP_WARN(this->get_logger(),
+                  "piece %u IK failed (pick=%s/place=%s), trying next",
                   static_cast<unsigned>(piece_id),
-                  pick_joints.size(),
-                  place_joints.size());
-      break;
+                  pick_ok ? "ok" : "fail",
+                  place_ok ? "ok" : "fail");
     }
 
     if (!found) {
       response->accepted = false;
-      response->message = "IK failed for cell " + std::to_string(cell_id) +
+      response->message = "IK failed for cell " +
+                          std::to_string(static_cast<unsigned>(cell_id)) +
                           " after " + std::to_string(ranked.size()) + " pieces tried";
       RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+      dump_failure_context(request);
       return;
     }
 
@@ -522,6 +559,46 @@ class StudentPlayerNode : public rclcpp::Node {
                 "final plan: piece=%u -> cell=%u, 4 trajectories built",
                 static_cast<unsigned>(chosen_piece),
                 static_cast<unsigned>(cell_id));
+  }
+
+  static double vector_l2_norm(const std::vector<double> &v) {
+    double sum = 0.0;
+    for (double x : v) sum += x * x;
+    return std::sqrt(sum);
+  }
+
+  void dump_failure_context(
+      const std::shared_ptr<ttt_interfaces::srv::PlanTurn::Request> &request) {
+    try {
+      std::ostringstream oss;
+      oss << "[failure dump] turn=" << request->turn_index
+          << " player_id=" << static_cast<unsigned>(request->player_id)
+          << " self=" << static_cast<unsigned>(player_id_)
+          << " board=[";
+      for (size_t i = 0; i < request->snapshot.board.size(); ++i) {
+        if (i > 0) oss << ",";
+        oss << static_cast<unsigned>(request->snapshot.board[i]);
+      }
+      oss << "] legal=[";
+      for (size_t i = 0; i < request->snapshot.legal_actions.size(); ++i) {
+        if (i > 0) oss << ",";
+        oss << static_cast<unsigned>(request->snapshot.legal_actions[i]);
+      }
+      oss << "] available_pieces=[";
+      bool first = true;
+      for (const auto &p : request->snapshot.pieces) {
+        if (!p.available) continue;
+        if (p.owner != player_id_) continue;
+        if (!first) oss << ",";
+        first = false;
+        oss << static_cast<unsigned>(p.piece_id);
+      }
+      oss << "]";
+      RCLCPP_ERROR(this->get_logger(), "%s", oss.str().c_str());
+    } catch (...) {
+      // dump itself must never throw — caller is already on a failure path.
+      RCLCPP_ERROR(this->get_logger(), "[failure dump] (formatting failed)");
+    }
   }
 
   static std::optional<geometry_msgs::msg::Pose> find_piece_pose(
