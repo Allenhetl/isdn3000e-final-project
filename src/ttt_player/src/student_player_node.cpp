@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -94,6 +95,125 @@ moveit_msgs::msg::RobotTrajectory make_three_point_trajectory(
   trajectory.joint_trajectory.points.push_back(make_point(midpoint, end_time_sec * 0.5));
   trajectory.joint_trajectory.points.push_back(make_point(end_positions, end_time_sec));
   return trajectory;
+}
+
+// ------------------------------------------------------------------
+// Game logic (Minimax with alpha-beta pruning)
+// ------------------------------------------------------------------
+
+constexpr int kWinScore = 10000;
+constexpr int kLossScore = -10000;
+constexpr int kAlphaInit = -100000;
+constexpr int kBetaInit = 100000;
+constexpr uint8_t kSentinelNoCell = 0xFF;
+
+// Indexed by cell_id; lower value = higher tie-break preference.
+// Derived from preference order [4, 0, 2, 6, 8, 1, 3, 5, 7]
+// (center > corners > edges).
+constexpr std::array<int, 9> kCellTieBreakRank = {1, 5, 2, 6, 0, 7, 3, 8, 4};
+
+// 8 win lines: 3 rows, 3 cols, 2 diagonals. Order copied verbatim from
+// ttt_game/pettingzoo_adapter.py::_check_winner.
+constexpr std::array<std::array<uint8_t, 3>, 8> kWinLines = {{
+    {{0, 1, 2}}, {{3, 4, 5}}, {{6, 7, 8}},
+    {{0, 3, 6}}, {{1, 4, 7}}, {{2, 5, 8}},
+    {{0, 4, 8}}, {{2, 4, 6}},
+}};
+
+// Returns 1 or 2 if that player has won; 0 otherwise (no winner / not terminal).
+uint8_t check_winner(const std::array<uint8_t, 9> &board) {
+  for (const auto &line : kWinLines) {
+    const uint8_t a = board[line[0]];
+    if (a == 0) continue;
+    if (a == board[line[1]] && a == board[line[2]]) {
+      return a;
+    }
+  }
+  return 0;
+}
+
+bool board_is_full(const std::array<uint8_t, 9> &board) {
+  for (uint8_t v : board) {
+    if (v == 0) return false;
+  }
+  return true;
+}
+
+// Score from `my_player_id`'s perspective.
+int minimax(std::array<uint8_t, 9> &board,
+            uint8_t to_move,
+            uint8_t my_player_id,
+            int depth,
+            int alpha,
+            int beta) {
+  const uint8_t winner = check_winner(board);
+  if (winner == my_player_id) return kWinScore - depth;
+  if (winner != 0) return kLossScore + depth;
+  if (board_is_full(board)) return 0;
+
+  const uint8_t next_to_move = static_cast<uint8_t>(3 - to_move);
+  const bool maximizing = (to_move == my_player_id);
+
+  if (maximizing) {
+    int best = kAlphaInit;
+    for (int cell = 0; cell < 9; ++cell) {
+      if (board[cell] != 0) continue;
+      board[cell] = to_move;
+      const int value = minimax(board, next_to_move, my_player_id, depth + 1, alpha, beta);
+      board[cell] = 0;
+      if (value > best) best = value;
+      if (best > alpha) alpha = best;
+      if (beta <= alpha) break;
+    }
+    return best;
+  } else {
+    int best = kBetaInit;
+    for (int cell = 0; cell < 9; ++cell) {
+      if (board[cell] != 0) continue;
+      board[cell] = to_move;
+      const int value = minimax(board, next_to_move, my_player_id, depth + 1, alpha, beta);
+      board[cell] = 0;
+      if (value < best) best = value;
+      if (best < beta) beta = best;
+      if (beta <= alpha) break;
+    }
+    return best;
+  }
+}
+
+// Root-level argmax with deterministic tie-break (kCellTieBreakRank).
+// Returns 0..8, or kSentinelNoCell if no legal move available.
+uint8_t minimax_best_move(const ttt_interfaces::msg::GameSnapshot &snapshot,
+                          uint8_t my_player_id) {
+  std::array<uint8_t, 9> board{};
+  for (size_t i = 0; i < 9; ++i) {
+    board[i] = snapshot.board[i];
+  }
+
+  int best_score = kAlphaInit - 1;
+  int best_rank = std::numeric_limits<int>::max();
+  uint8_t best_cell = kSentinelNoCell;
+
+  const uint8_t opponent = static_cast<uint8_t>(3 - my_player_id);
+
+  for (int cell = 0; cell < 9; ++cell) {
+    if (snapshot.legal_actions[cell] != 1) continue;
+    if (board[cell] != 0) continue;  // defensive: should never happen if legal
+
+    board[cell] = my_player_id;
+    const int value = minimax(board, opponent, my_player_id,
+                              /*depth=*/1, kAlphaInit, kBetaInit);
+    board[cell] = 0;
+
+    const int rank = kCellTieBreakRank[cell];
+    if (value > best_score || (value == best_score && rank < best_rank)) {
+      best_score = value;
+      best_rank = rank;
+      best_cell = static_cast<uint8_t>(cell);
+    }
+  }
+
+  return best_cell;
 }
 
 }  // namespace
@@ -201,41 +321,31 @@ class StudentPlayerNode : public rclcpp::Node {
       return;
     }
 
-    // TODO(student): Implement your turn-planning logic here.
-    // Suggested structure:
-    // 1. Choose a legal `(piece_id, cell_id)` pair from `request->snapshot`.
-    // 2. Look up the current pose of the chosen stock piece.
-    // 3. Look up the target board cell pose from `request->layout.cell_poses`.
-    // 4. Convert those TCP targets into `panda_link8` poses using
-    //    `link8_pose_from_tcp_target(...)`.
-    // 5. Call `compute_ik(...)` for the pick target and place target.
-    // 6. Build the four required trajectories:
-    //      - home_to_pick
-    //      - pick_to_home
-    //      - home_to_place
-    //      - place_to_home
-    // 7. Fill `response->plan` and set `response->accepted = true` on success.
-    //
-    // The fallback below intentionally rejects every turn. This keeps the
-    // starter repository buildable while making it clear that students must
-    // implement their own planner.
+    const uint8_t cell_id = minimax_best_move(request->snapshot, player_id_);
+    if (cell_id == kSentinelNoCell) {
+      response->accepted = false;
+      response->message = "no legal cell available";
+      RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+      return;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "turn=%u: minimax chose cell=%u",
+                static_cast<unsigned>(request->turn_index),
+                static_cast<unsigned>(cell_id));
+
     response->accepted = false;
-    response->message = "TODO(student): implement handle_plan_turn().";
+    response->message = "A-only stub: cell chosen, B/C pending";
   }
 
-  static geometry_msgs::msg::Pose find_piece_pose(
+  static std::optional<geometry_msgs::msg::Pose> find_piece_pose(
       const ttt_interfaces::msg::GameSnapshot &snapshot,
       uint8_t piece_id) {
-    // TODO(student): Search `snapshot.pieces` for the requested `piece_id` and
-    // return its pose. You may choose to throw an exception or return a
-    // fallback pose if the piece is missing.
-    (void)snapshot;
-    (void)piece_id;
-
-    // Dummy fallback to keep the starter code compilable.
-    geometry_msgs::msg::Pose fallback;
-    fallback.orientation.w = 1.0;
-    return fallback;
+    for (const auto &piece : snapshot.pieces) {
+      if (piece.piece_id == piece_id) {
+        return piece.pose;
+      }
+    }
+    return std::nullopt;
   }
 
   std::string player_name_;
