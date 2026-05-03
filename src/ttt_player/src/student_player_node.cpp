@@ -6,7 +6,10 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <random>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -216,6 +219,33 @@ uint8_t minimax_best_move(const ttt_interfaces::msg::GameSnapshot &snapshot,
   return best_cell;
 }
 
+// Sort own available pieces by ascending distance to the Panda base
+// (sqrt(x^2 + y^2)). No hardcoded piece_id list — works for both
+// player_0 and player_1 because their geometries are mirrored.
+std::vector<uint8_t> rank_pieces_by_distance(
+    const ttt_interfaces::msg::GameSnapshot &snapshot,
+    uint8_t my_player_id) {
+  struct Entry {
+    uint8_t piece_id;
+    double distance;
+  };
+  std::vector<Entry> entries;
+  entries.reserve(snapshot.pieces.size());
+  for (const auto &piece : snapshot.pieces) {
+    if (!piece.available) continue;
+    if (piece.owner != my_player_id) continue;
+    const double dx = piece.pose.position.x;
+    const double dy = piece.pose.position.y;
+    entries.push_back({piece.piece_id, std::sqrt(dx * dx + dy * dy)});
+  }
+  std::sort(entries.begin(), entries.end(),
+            [](const Entry &a, const Entry &b) { return a.distance < b.distance; });
+  std::vector<uint8_t> result;
+  result.reserve(entries.size());
+  for (const auto &e : entries) result.push_back(e.piece_id);
+  return result;
+}
+
 }  // namespace
 
 class StudentPlayerNode : public rclcpp::Node {
@@ -290,21 +320,84 @@ class StudentPlayerNode : public rclcpp::Node {
   std::optional<std::vector<double>> compute_ik(
       const geometry_msgs::msg::Pose &target_pose,
       const std::vector<double> &seed_positions) {
-    (void)target_pose;
-    (void)seed_positions;
+    auto request = std::make_shared<moveit_msgs::srv::GetPositionIK::Request>();
+    request->ik_request.group_name = "panda_arm";
+    request->ik_request.pose_stamped.header.frame_id = "panda_link0";
+    request->ik_request.pose_stamped.pose = target_pose;
+    request->ik_request.timeout.sec = 5;
+    request->ik_request.avoid_collisions = false;
 
-    // TODO(student): Call the MoveIt `/compute_ik` service here.
-    // Suggested steps:
-    // 1. Create a `moveit_msgs::srv::GetPositionIK::Request`.
-    // 2. Set `group_name = "panda_arm"`.
-    // 3. Fill the seed joint state with the provided `seed_positions`.
-    // 4. Set the target pose in frame `panda_link0`.
-    // 5. Send the request through `ik_client_` and wait for the response.
-    // 6. Extract the 7 Panda arm joints from the solution and return them.
-    // 7. Return `std::nullopt` if IK times out or fails.
-    //
-    // The dummy return below keeps the starter code buildable, but it does not
-    // solve IK. Students should replace it with a real implementation.
+    moveit_msgs::msg::RobotState seed_state;
+    seed_state.joint_state.name = panda_joint_names();
+    seed_state.joint_state.position = seed_positions;
+    request->ik_request.robot_state = seed_state;
+
+    // Synchronous wait inside a service callback: must NOT use
+    // spin_until_future_complete (would re-enter the executor and deadlock,
+    // even with Reentrant callback group). Poll wait_for(10ms) until a 6s
+    // deadline elapses (1s margin over ik_request.timeout = 5s).
+    auto future = ik_client_->async_send_request(request);
+    const auto deadline = std::chrono::steady_clock::now() + 6s;
+    while (rclcpp::ok()) {
+      if (future.wait_for(10ms) == std::future_status::ready) break;
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return std::nullopt;
+      }
+    }
+    if (!rclcpp::ok()) return std::nullopt;
+
+    auto result = future.get();
+    if (!result) return std::nullopt;
+    // MoveItErrorCodes::SUCCESS == 1
+    if (result->error_code.val != 1) return std::nullopt;
+
+    // The returned joint_state often includes the two finger joints and
+    // the 7 arm joints in an unspecified order. Index by name and pull
+    // out panda_joint1..7 strictly in that order.
+    const auto &sol = result->solution.joint_state;
+    if (sol.name.size() != sol.position.size()) return std::nullopt;
+    std::unordered_map<std::string, double> by_name;
+    by_name.reserve(sol.name.size());
+    for (size_t i = 0; i < sol.name.size(); ++i) {
+      by_name.emplace(sol.name[i], sol.position[i]);
+    }
+    std::vector<double> arm_joints;
+    arm_joints.reserve(7);
+    for (const auto &name : panda_joint_names()) {
+      auto it = by_name.find(name);
+      if (it == by_name.end()) return std::nullopt;
+      arm_joints.push_back(it->second);
+    }
+    if (arm_joints.size() != 7) return std::nullopt;
+    return arm_joints;
+  }
+
+  // Multi-seed retry: home -> last_solution_ -> 3x home + N(0, 0.1 rad).
+  // Updates last_solution_ on first success. Returns nullopt if all 5
+  // seeds fail. No logging here — caller decides whether failure of an
+  // entire piece warrants a WARN.
+  std::optional<std::vector<double>> compute_ik_robust(
+      const geometry_msgs::msg::Pose &target_pose) {
+    std::vector<std::vector<double>> seeds;
+    seeds.reserve(5);
+    seeds.push_back(kHomePositions);
+    seeds.push_back(last_solution_);
+
+    static thread_local std::mt19937 rng{std::random_device{}()};
+    std::normal_distribution<double> noise(0.0, 0.1);
+    for (int attempt = 0; attempt < 3; ++attempt) {
+      std::vector<double> perturbed = kHomePositions;
+      for (auto &v : perturbed) v += noise(rng);
+      seeds.push_back(std::move(perturbed));
+    }
+
+    for (const auto &seed : seeds) {
+      auto solution = compute_ik(target_pose, seed);
+      if (solution) {
+        last_solution_ = *solution;
+        return solution;
+      }
+    }
     return std::nullopt;
   }
 
@@ -328,13 +421,107 @@ class StudentPlayerNode : public rclcpp::Node {
       RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
       return;
     }
-
     RCLCPP_INFO(this->get_logger(), "turn=%u: minimax chose cell=%u",
                 static_cast<unsigned>(request->turn_index),
                 static_cast<unsigned>(cell_id));
 
-    response->accepted = false;
-    response->message = "A-only stub: cell chosen, B/C pending";
+    if (cell_id >= request->layout.cell_poses.size()) {
+      response->accepted = false;
+      response->message = "cell_id out of range for layout.cell_poses";
+      RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+      return;
+    }
+
+    const auto ranked = rank_pieces_by_distance(request->snapshot, player_id_);
+    if (ranked.empty()) {
+      response->accepted = false;
+      response->message =
+          std::string("no available piece for player_") + std::to_string(player_id_);
+      RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+      return;
+    }
+    {
+      std::ostringstream oss;
+      oss << "ranked pieces for cell " << static_cast<unsigned>(cell_id) << ": [";
+      for (size_t i = 0; i < ranked.size(); ++i) {
+        if (i > 0) oss << ", ";
+        oss << static_cast<unsigned>(ranked[i]);
+      }
+      oss << "]";
+      RCLCPP_INFO(this->get_logger(), "%s", oss.str().c_str());
+    }
+
+    const auto &cell_pose = request->layout.cell_poses[cell_id];
+    const auto place_link8 = link8_pose_from_tcp_target(
+        cell_pose.position.x, cell_pose.position.y, cell_pose.position.z);
+
+    uint8_t chosen_piece = 0;
+    std::vector<double> pick_joints;
+    std::vector<double> place_joints;
+    bool found = false;
+
+    for (uint8_t piece_id : ranked) {
+      const auto piece_pose_opt = find_piece_pose(request->snapshot, piece_id);
+      if (!piece_pose_opt) {
+        RCLCPP_WARN(this->get_logger(), "piece %u not found in snapshot, trying next",
+                    static_cast<unsigned>(piece_id));
+        continue;
+      }
+      const auto pick_link8 = link8_pose_from_tcp_target(
+          piece_pose_opt->position.x,
+          piece_pose_opt->position.y,
+          piece_pose_opt->position.z);
+
+      auto pick_sol = compute_ik_robust(pick_link8);
+      if (!pick_sol) {
+        RCLCPP_WARN(this->get_logger(), "piece %u IK failed at pick, trying next",
+                    static_cast<unsigned>(piece_id));
+        continue;
+      }
+      auto place_sol = compute_ik_robust(place_link8);
+      if (!place_sol) {
+        RCLCPP_WARN(this->get_logger(), "piece %u IK failed at place, trying next",
+                    static_cast<unsigned>(piece_id));
+        continue;
+      }
+      chosen_piece = piece_id;
+      pick_joints = std::move(*pick_sol);
+      place_joints = std::move(*place_sol);
+      found = true;
+      RCLCPP_INFO(this->get_logger(),
+                  "piece %u IK ok (pick joints=%zu, place joints=%zu)",
+                  static_cast<unsigned>(piece_id),
+                  pick_joints.size(),
+                  place_joints.size());
+      break;
+    }
+
+    if (!found) {
+      response->accepted = false;
+      response->message = "IK failed for cell " + std::to_string(cell_id) +
+                          " after " + std::to_string(ranked.size()) + " pieces tried";
+      RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+      return;
+    }
+
+    ttt_interfaces::msg::TurnPlan plan;
+    plan.match_id = request->match_id;
+    plan.turn_index = request->turn_index;
+    plan.player_id = request->player_id;
+    plan.piece_id = chosen_piece;
+    plan.cell_id = cell_id;
+    plan.home_to_pick = make_three_point_trajectory(kHomePositions, pick_joints, 1.5);
+    plan.pick_to_home = make_three_point_trajectory(pick_joints, kHomePositions, 1.5);
+    plan.home_to_place = make_three_point_trajectory(kHomePositions, place_joints, 1.5);
+    plan.place_to_home = make_three_point_trajectory(place_joints, kHomePositions, 1.5);
+
+    response->plan = plan;
+    response->accepted = true;
+    response->message = "ok";
+    RCLCPP_INFO(this->get_logger(),
+                "final plan: piece=%u -> cell=%u, 4 trajectories built",
+                static_cast<unsigned>(chosen_piece),
+                static_cast<unsigned>(cell_id));
   }
 
   static std::optional<geometry_msgs::msg::Pose> find_piece_pose(
@@ -353,6 +540,12 @@ class StudentPlayerNode : public rclcpp::Node {
   bool registered_{false};
   bool registration_in_flight_{false};
   uint8_t player_id_{255};
+  // Cached last successful IK solution; seeds round-2 of compute_ik_robust.
+  // Initialized to home so the first turn naturally falls back to seed-1
+  // (home) without reading uninitialized values. Engine schedules
+  // plan_turn serially (engine_node.py pending_turn_future), so no mutex
+  // is needed here.
+  std::vector<double> last_solution_ = kHomePositions;
 
   rclcpp::CallbackGroup::SharedPtr cb_group_;
   rclcpp::Client<ttt_interfaces::srv::RegisterPlayer>::SharedPtr register_client_;
