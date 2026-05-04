@@ -18,6 +18,8 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <moveit_msgs/msg/robot_state.hpp>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
+#include <moveit_msgs/srv/get_cartesian_path.hpp>
+#include <moveit_msgs/srv/get_position_fk.hpp>
 #include <moveit_msgs/srv/get_position_ik.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
@@ -272,6 +274,16 @@ class StudentPlayerNode : public rclcpp::Node {
         rmw_qos_profile_services_default,
         cb_group_);
 
+    cartesian_client_ = this->create_client<moveit_msgs::srv::GetCartesianPath>(
+        "/compute_cartesian_path",
+        rmw_qos_profile_services_default,
+        cb_group_);
+
+    fk_client_ = this->create_client<moveit_msgs::srv::GetPositionFK>(
+        "/compute_fk",
+        rmw_qos_profile_services_default,
+        cb_group_);
+
     plan_turn_service_server_ = this->create_service<ttt_interfaces::srv::PlanTurn>(
         plan_turn_service_,
         std::bind(&StudentPlayerNode::handle_plan_turn, this, std::placeholders::_1,
@@ -406,6 +418,168 @@ class StudentPlayerNode : public rclcpp::Node {
     return std::nullopt;
   }
 
+  // Synchronous /compute_fk wrapper. Returns the Pose of `link_name` for
+  // the given joint configuration, or nullopt on failure. Same future-
+  // polling pattern as compute_ik (no spin_until_future_complete).
+  std::optional<geometry_msgs::msg::Pose> compute_fk(
+      const std::vector<double> &joint_positions,
+      const std::string &link_name = "panda_link8") {
+    if (!fk_client_->service_is_ready()) {
+      if (!fk_client_->wait_for_service(2s)) {
+        return std::nullopt;
+      }
+    }
+
+    auto request = std::make_shared<moveit_msgs::srv::GetPositionFK::Request>();
+    request->header.frame_id = "panda_link0";
+    request->fk_link_names = {link_name};
+    request->robot_state.joint_state.name = panda_joint_names();
+    request->robot_state.joint_state.position = joint_positions;
+
+    auto future = fk_client_->async_send_request(request);
+    const auto deadline = std::chrono::steady_clock::now() + 6s;
+    while (rclcpp::ok()) {
+      if (future.wait_for(10ms) == std::future_status::ready) break;
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return std::nullopt;
+      }
+    }
+    if (!rclcpp::ok()) return std::nullopt;
+
+    auto result = future.get();
+    if (!result) return std::nullopt;
+    if (result->error_code.val != 1) return std::nullopt;
+    if (result->pose_stamped.empty()) return std::nullopt;
+    return result->pose_stamped[0].pose;
+  }
+
+  // Plan a Cartesian-linear motion via MoveIt /compute_cartesian_path.
+  // Output trajectory's TCP follows a straight line from the FK pose of
+  // `start_joints` to `end_link8_pose`. Returns nullopt if the service
+  // is unavailable, fraction < kCartesianFractionThreshold, or the
+  // result is empty/invalid. Caller falls back to make_smooth_trajectory.
+  std::optional<moveit_msgs::msg::RobotTrajectory> compute_cartesian_trajectory(
+      const std::vector<double> &start_joints,
+      const geometry_msgs::msg::Pose &end_link8_pose) {
+    constexpr double kCartesianMaxStep = 0.005;          // 5 mm Cartesian resolution
+    constexpr double kCartesianJumpThreshold = 0.0;       // 0 disables joint-jump limit
+    constexpr double kCartesianFractionThreshold = 0.95;  // accept >=95% completion
+
+    if (!cartesian_client_->service_is_ready()) {
+      if (!cartesian_client_->wait_for_service(2s)) {
+        return std::nullopt;
+      }
+    }
+
+    auto request = std::make_shared<moveit_msgs::srv::GetCartesianPath::Request>();
+    request->header.frame_id = "panda_link0";
+    request->start_state.joint_state.name = panda_joint_names();
+    request->start_state.joint_state.position = start_joints;
+    request->group_name = "panda_arm";
+    request->link_name = "panda_link8";
+    request->waypoints = {end_link8_pose};
+    request->max_step = kCartesianMaxStep;
+    request->jump_threshold = kCartesianJumpThreshold;
+    request->avoid_collisions = false;
+
+    auto future = cartesian_client_->async_send_request(request);
+    const auto deadline = std::chrono::steady_clock::now() + 6s;
+    while (rclcpp::ok()) {
+      if (future.wait_for(10ms) == std::future_status::ready) break;
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return std::nullopt;
+      }
+    }
+    if (!rclcpp::ok()) return std::nullopt;
+
+    auto result = future.get();
+    if (!result) return std::nullopt;
+    if (result->fraction < kCartesianFractionThreshold) return std::nullopt;
+    if (result->solution.joint_trajectory.points.empty()) return std::nullopt;
+
+    // The cartesian_path service writes the full robot's joint_names
+    // (which may include finger joints in some setups). Force-rewrite
+    // joint_names + filter each point's positions to the 7 panda_joints
+    // in the canonical order so referee's strict equality check passes.
+    return normalize_arm_trajectory(result->solution);
+  }
+
+  // Re-emit a RobotTrajectory whose joint_trajectory contains only the
+  // 7 panda_joints in canonical order. If any expected joint is missing
+  // in the source, returns nullopt (caller falls back).
+  std::optional<moveit_msgs::msg::RobotTrajectory> normalize_arm_trajectory(
+      const moveit_msgs::msg::RobotTrajectory &source) {
+    const auto arm_names = panda_joint_names();
+    const auto &src_names = source.joint_trajectory.joint_names;
+
+    // Build name -> source-index map.
+    std::unordered_map<std::string, size_t> name_to_idx;
+    name_to_idx.reserve(src_names.size());
+    for (size_t i = 0; i < src_names.size(); ++i) {
+      name_to_idx.emplace(src_names[i], i);
+    }
+    std::vector<size_t> arm_idx;
+    arm_idx.reserve(arm_names.size());
+    for (const auto &n : arm_names) {
+      auto it = name_to_idx.find(n);
+      if (it == name_to_idx.end()) return std::nullopt;
+      arm_idx.push_back(it->second);
+    }
+
+    moveit_msgs::msg::RobotTrajectory out;
+    out.joint_trajectory.joint_names = arm_names;
+    out.joint_trajectory.points.reserve(source.joint_trajectory.points.size());
+    for (const auto &src_point : source.joint_trajectory.points) {
+      if (src_point.positions.size() != src_names.size()) return std::nullopt;
+      trajectory_msgs::msg::JointTrajectoryPoint pt;
+      pt.positions.reserve(arm_names.size());
+      for (size_t i : arm_idx) {
+        pt.positions.push_back(src_point.positions[i]);
+      }
+      pt.time_from_start = src_point.time_from_start;
+      out.joint_trajectory.points.push_back(std::move(pt));
+    }
+    if (out.joint_trajectory.points.empty()) return std::nullopt;
+    return out;
+  }
+
+  // Lazy-cached link8 pose corresponding to kHomePositions, used as the
+  // Cartesian endpoint for the *_to_home trajectories. Filled on first
+  // use via /compute_fk; nullopt means FK unavailable (caller falls back).
+  std::optional<geometry_msgs::msg::Pose> ensure_home_link8_pose() {
+    if (cached_home_link8_pose_) return cached_home_link8_pose_;
+    auto pose = compute_fk(kHomePositions, "panda_link8");
+    if (pose) cached_home_link8_pose_ = pose;
+    return cached_home_link8_pose_;
+  }
+
+  // Try Cartesian path first, fall back to joint-linear smoothing on
+  // any failure. Logs which path was taken at INFO level.
+  moveit_msgs::msg::RobotTrajectory plan_segment(
+      const std::vector<double> &start_joints,
+      const std::vector<double> &fallback_end_joints,
+      const std::optional<geometry_msgs::msg::Pose> &cartesian_end,
+      const char *label) {
+    if (cartesian_end) {
+      auto traj = compute_cartesian_trajectory(start_joints, *cartesian_end);
+      if (traj) {
+        RCLCPP_INFO(this->get_logger(),
+                    "%s: cartesian path ok (%zu points)",
+                    label,
+                    traj->joint_trajectory.points.size());
+        return *traj;
+      }
+      RCLCPP_WARN(this->get_logger(),
+                  "%s: cartesian path failed, falling back to joint-linear",
+                  label);
+    } else {
+      RCLCPP_WARN(this->get_logger(),
+                  "%s: cartesian endpoint unavailable, using joint-linear",
+                  label);
+    }
+    return make_smooth_trajectory(start_joints, fallback_end_joints, 1.5);
+  }
+
   // ----------------------------------------------------------------
   // Turn planning
   // ----------------------------------------------------------------
@@ -496,6 +670,7 @@ class StudentPlayerNode : public rclcpp::Node {
     uint8_t chosen_piece = 0;
     std::vector<double> pick_joints;
     std::vector<double> place_joints;
+    geometry_msgs::msg::Pose chosen_pick_link8;
     bool found = false;
 
     for (uint8_t piece_id : ranked) {
@@ -521,6 +696,7 @@ class StudentPlayerNode : public rclcpp::Node {
         chosen_piece = piece_id;
         pick_joints = std::move(*pick_sol);
         place_joints = std::move(*place_sol);
+        chosen_pick_link8 = pick_link8;
         found = true;
         RCLCPP_INFO(this->get_logger(),
                     "piece %u IK ok (pick norm=%.3f, place norm=%.3f)",
@@ -552,10 +728,15 @@ class StudentPlayerNode : public rclcpp::Node {
     plan.player_id = request->player_id;
     plan.piece_id = chosen_piece;
     plan.cell_id = cell_id;
-    plan.home_to_pick = make_smooth_trajectory(kHomePositions, pick_joints, 1.5);
-    plan.pick_to_home = make_smooth_trajectory(pick_joints, kHomePositions, 1.5);
-    plan.home_to_place = make_smooth_trajectory(kHomePositions, place_joints, 1.5);
-    plan.place_to_home = make_smooth_trajectory(place_joints, kHomePositions, 1.5);
+    const auto home_link8 = ensure_home_link8_pose();
+    plan.home_to_pick = plan_segment(kHomePositions, pick_joints,
+                                     chosen_pick_link8, "home_to_pick");
+    plan.pick_to_home = plan_segment(pick_joints, kHomePositions,
+                                     home_link8, "pick_to_home");
+    plan.home_to_place = plan_segment(kHomePositions, place_joints,
+                                      place_link8, "home_to_place");
+    plan.place_to_home = plan_segment(place_joints, kHomePositions,
+                                      home_link8, "place_to_home");
 
     response->plan = plan;
     response->accepted = true;
@@ -628,10 +809,17 @@ class StudentPlayerNode : public rclcpp::Node {
   // plan_turn serially (engine_node.py pending_turn_future), so no mutex
   // is needed here.
   std::vector<double> last_solution_ = kHomePositions;
+  // Cached link8 pose for kHomePositions, populated lazily on first
+  // plan_turn via /compute_fk. Used as the Cartesian endpoint for the
+  // pick_to_home / place_to_home segments. nullopt means FK failed —
+  // those segments fall back to joint-linear smoothing.
+  std::optional<geometry_msgs::msg::Pose> cached_home_link8_pose_;
 
   rclcpp::CallbackGroup::SharedPtr cb_group_;
   rclcpp::Client<ttt_interfaces::srv::RegisterPlayer>::SharedPtr register_client_;
   rclcpp::Client<moveit_msgs::srv::GetPositionIK>::SharedPtr ik_client_;
+  rclcpp::Client<moveit_msgs::srv::GetCartesianPath>::SharedPtr cartesian_client_;
+  rclcpp::Client<moveit_msgs::srv::GetPositionFK>::SharedPtr fk_client_;
   rclcpp::Service<ttt_interfaces::srv::PlanTurn>::SharedPtr plan_turn_service_server_;
   rclcpp::TimerBase::SharedPtr register_timer_;
 };
