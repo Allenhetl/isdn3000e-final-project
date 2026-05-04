@@ -78,28 +78,6 @@ trajectory_msgs::msg::JointTrajectoryPoint make_point(
   return point;
 }
 
-moveit_msgs::msg::RobotTrajectory make_three_point_trajectory(
-    const std::vector<double> &start_positions,
-    const std::vector<double> &end_positions,
-    double end_time_sec) {
-  moveit_msgs::msg::RobotTrajectory trajectory;
-  trajectory.joint_trajectory.joint_names = panda_joint_names();
-
-  const std::vector<double> midpoint = [&]() {
-    std::vector<double> result;
-    result.reserve(start_positions.size());
-    for (size_t index = 0; index < start_positions.size(); ++index) {
-      result.push_back((start_positions[index] + end_positions[index]) * 0.5);
-    }
-    return result;
-  }();
-
-  trajectory.joint_trajectory.points.push_back(make_point(start_positions, 0.0));
-  trajectory.joint_trajectory.points.push_back(make_point(midpoint, end_time_sec * 0.5));
-  trajectory.joint_trajectory.points.push_back(make_point(end_positions, end_time_sec));
-  return trajectory;
-}
-
 // Multi-point joint-space linear interpolation between start and end.
 // Generates `num_points` evenly spaced waypoints with monotonically
 // increasing time_from_start. Used for smoother visualizer playback —
