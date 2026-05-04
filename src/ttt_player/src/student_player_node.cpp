@@ -100,6 +100,33 @@ moveit_msgs::msg::RobotTrajectory make_three_point_trajectory(
   return trajectory;
 }
 
+// Multi-point joint-space linear interpolation between start and end.
+// Generates `num_points` evenly spaced waypoints with monotonically
+// increasing time_from_start. Used for smoother visualizer playback —
+// referee only validates the final point so any num_points >= 1 passes.
+moveit_msgs::msg::RobotTrajectory make_smooth_trajectory(
+    const std::vector<double> &start_positions,
+    const std::vector<double> &end_positions,
+    double end_time_sec,
+    int num_points = 30) {
+  moveit_msgs::msg::RobotTrajectory trajectory;
+  trajectory.joint_trajectory.joint_names = panda_joint_names();
+  if (num_points < 2) num_points = 2;
+
+  trajectory.joint_trajectory.points.reserve(num_points);
+  const size_t dof = start_positions.size();
+  const double inv_last = 1.0 / static_cast<double>(num_points - 1);
+  for (int i = 0; i < num_points; ++i) {
+    const double t = static_cast<double>(i) * inv_last;
+    std::vector<double> pos(dof);
+    for (size_t j = 0; j < dof; ++j) {
+      pos[j] = start_positions[j] + t * (end_positions[j] - start_positions[j]);
+    }
+    trajectory.joint_trajectory.points.push_back(make_point(pos, t * end_time_sec));
+  }
+  return trajectory;
+}
+
 // ------------------------------------------------------------------
 // Game logic (Minimax with alpha-beta pruning)
 // ------------------------------------------------------------------
@@ -547,10 +574,10 @@ class StudentPlayerNode : public rclcpp::Node {
     plan.player_id = request->player_id;
     plan.piece_id = chosen_piece;
     plan.cell_id = cell_id;
-    plan.home_to_pick = make_three_point_trajectory(kHomePositions, pick_joints, 1.5);
-    plan.pick_to_home = make_three_point_trajectory(pick_joints, kHomePositions, 1.5);
-    plan.home_to_place = make_three_point_trajectory(kHomePositions, place_joints, 1.5);
-    plan.place_to_home = make_three_point_trajectory(place_joints, kHomePositions, 1.5);
+    plan.home_to_pick = make_smooth_trajectory(kHomePositions, pick_joints, 1.5);
+    plan.pick_to_home = make_smooth_trajectory(pick_joints, kHomePositions, 1.5);
+    plan.home_to_place = make_smooth_trajectory(kHomePositions, place_joints, 1.5);
+    plan.place_to_home = make_smooth_trajectory(place_joints, kHomePositions, 1.5);
 
     response->plan = plan;
     response->accepted = true;
