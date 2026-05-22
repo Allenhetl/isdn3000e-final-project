@@ -149,27 +149,28 @@ bool board_is_full(const std::array<uint8_t, 9> &board) {
   return true;
 }
 
-// Score from `my_player_id`'s perspective.
+// Score from `my_mark`'s perspective. `my_mark` and `to_move` are board
+// marks (1 or 2), NOT the engine's 0/1 player_id — see minimax_best_move.
 int minimax(std::array<uint8_t, 9> &board,
             uint8_t to_move,
-            uint8_t my_player_id,
+            uint8_t my_mark,
             int depth,
             int alpha,
             int beta) {
   const uint8_t winner = check_winner(board);
-  if (winner == my_player_id) return kWinScore - depth;
+  if (winner == my_mark) return kWinScore - depth;
   if (winner != 0) return kLossScore + depth;
   if (board_is_full(board)) return 0;
 
   const uint8_t next_to_move = static_cast<uint8_t>(3 - to_move);
-  const bool maximizing = (to_move == my_player_id);
+  const bool maximizing = (to_move == my_mark);
 
   if (maximizing) {
     int best = kAlphaInit;
     for (int cell = 0; cell < 9; ++cell) {
       if (board[cell] != 0) continue;
       board[cell] = to_move;
-      const int value = minimax(board, next_to_move, my_player_id, depth + 1, alpha, beta);
+      const int value = minimax(board, next_to_move, my_mark, depth + 1, alpha, beta);
       board[cell] = 0;
       if (value > best) best = value;
       if (best > alpha) alpha = best;
@@ -181,7 +182,7 @@ int minimax(std::array<uint8_t, 9> &board,
     for (int cell = 0; cell < 9; ++cell) {
       if (board[cell] != 0) continue;
       board[cell] = to_move;
-      const int value = minimax(board, next_to_move, my_player_id, depth + 1, alpha, beta);
+      const int value = minimax(board, next_to_move, my_mark, depth + 1, alpha, beta);
       board[cell] = 0;
       if (value < best) best = value;
       if (best < beta) beta = best;
@@ -204,14 +205,19 @@ uint8_t minimax_best_move(const ttt_interfaces::msg::GameSnapshot &snapshot,
   int best_rank = std::numeric_limits<int>::max();
   uint8_t best_cell = kSentinelNoCell;
 
-  const uint8_t opponent = static_cast<uint8_t>(3 - my_player_id);
+  // snapshot.board and minimax use board marks (player_0 -> 1, player_1 -> 2),
+  // but `my_player_id` is the engine's 0/1 list index. Convert before
+  // feeding the search, otherwise minimax plays for the wrong side / writes
+  // EMPTY cells.
+  const uint8_t my_mark = static_cast<uint8_t>(my_player_id + 1);
+  const uint8_t opponent = static_cast<uint8_t>(3 - my_mark);
 
   for (int cell = 0; cell < 9; ++cell) {
     if (snapshot.legal_actions[cell] != 1) continue;
     if (board[cell] != 0) continue;  // defensive: should never happen if legal
 
-    board[cell] = my_player_id;
-    const int value = minimax(board, opponent, my_player_id,
+    board[cell] = my_mark;
+    const int value = minimax(board, opponent, my_mark,
                               /*depth=*/1, kAlphaInit, kBetaInit);
     board[cell] = 0;
 
