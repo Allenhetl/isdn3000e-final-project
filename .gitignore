@@ -18,3 +18,5 @@ __pycache__/
 
 # Verification artifacts
 artifacts/
+chat/
+CLAUDE.md
